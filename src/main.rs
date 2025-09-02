@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::{mpsc, Arc, Mutex};
+use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,49 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use sysinfo::System;
+
+#[cfg(windows)]
+mod win_disk_wmi {
+    use serde::Deserialize;
+    use wmi::{COMLibrary, WMIConnection, WMIError};
+
+    #[derive(Deserialize, Debug)]
+    #[allow(non_snake_case)]
+    pub struct PerfDisk {
+        pub Name: String,
+        pub DiskReadBytesPerSec: Option<u64>,
+        pub DiskWriteBytesPerSec: Option<u64>,
+    }
+
+    pub struct DiskCounters {
+        _com: COMLibrary,
+        conn: WMIConnection,
+    }
+
+    impl DiskCounters {
+        pub fn new() -> Result<Self, WMIError> {
+            let com = COMLibrary::new()?;
+            let conn = WMIConnection::new(com.clone())?;
+            Ok(Self { _com: com, conn })
+        }
+
+        pub fn read_total(&self) -> Result<(u64, u64), WMIError> {
+            // Use PhysicalDisk to include all physical devices; aggregate _Total
+            let q = "SELECT Name, DiskReadBytesPerSec, DiskWriteBytesPerSec \
+                     FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk";
+            let rows: Vec<PerfDisk> = self.conn.raw_query(q)?;
+            for row in rows {
+                if row.Name == "_Total" {
+                    return Ok((
+                        row.DiskReadBytesPerSec.unwrap_or(0),
+                        row.DiskWriteBytesPerSec.unwrap_or(0),
+                    ));
+                }
+            }
+            Ok((0, 0))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -58,6 +102,7 @@ struct NetBytes {
     rx: u64,
     tx: u64,
 }
+#[cfg(not(windows))]
 #[derive(Default, Clone, Copy)]
 struct DiskBytes {
     read: u64,
@@ -68,6 +113,8 @@ struct DiskBytes {
 struct Metrics {
     cpu_pct: f32,
     ram_pct: f32,
+    disk_r_mbps: f64,
+    disk_w_mbps: f64,
     disk_mbps: f64,
     net_kbps: f64,
     disk_pct: f64,
@@ -94,11 +141,21 @@ fn main() {
     let about_item = MenuItem::new(&about_text, false, None);
     let switch_item = MenuItem::new("Switch to Disk/Network", true, None);
     let overlay_item = MenuItem::new("Hide Overlay", true, None);
+    // Serial menu items
+    let mut serial_enabled = false;
+    let default_port = std::env::var("CRTM_SERIAL_PORT").unwrap_or_else(|_| "COM4".to_string());
+    let serial_toggle_item = MenuItem::new("[ ] Serial Output", true, None);
+    let serial_port_label = MenuItem::new(&format!("Port: {}", default_port), false, None);
+    let serial_refresh_item = MenuItem::new("Refresh Ports", true, None);
     let quit_item = PredefinedMenuItem::quit(None);
     menu.append(&about_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&switch_item).unwrap();
     menu.append(&overlay_item).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    menu.append(&serial_toggle_item).unwrap();
+    menu.append(&serial_port_label).unwrap();
+    menu.append(&serial_refresh_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&quit_item).unwrap();
 
@@ -120,6 +177,8 @@ fn main() {
         Arc::clone(&overlay_pos),
     ));
 
+    let serial_cfg = Arc::new(Mutex::new(SerialCfg { enabled: false, port: default_port.clone() }));
+
     spawn_monitor_thread(
         proxy.clone(),
         mode.clone(),
@@ -129,7 +188,13 @@ fn main() {
         Arc::clone(&shared_metrics),
     );
 
+    spawn_serial_worker(Arc::clone(&shared_metrics), Arc::clone(&serial_cfg));
+
     let menu_rx = MenuEvent::receiver();
+
+    // dynamic port items; built on first loop
+    let mut port_items: Vec<(MenuItem, String)> = Vec::new();
+    let mut ports_built = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -144,6 +209,18 @@ fn main() {
                 }
             }
             Event::MainEventsCleared => {
+                if !ports_built {
+                    if let Ok(ports) = serialport::available_ports() {
+                        for p in ports {
+                            let label = format!("Use {}", p.port_name);
+                            let item = MenuItem::new(&label, true, None);
+                            menu.append(&item).ok();
+                            port_items.push((item, p.port_name));
+                        }
+                    }
+                    ports_built = true;
+                }
+
                 while let Ok(ev) = menu_rx.try_recv() {
                     if ev.id == switch_item.id() {
                         let mut m = mode.lock().unwrap();
@@ -169,9 +246,35 @@ fn main() {
                             ));
                             let _ = overlay_item.set_text("Hide Overlay");
                         }
+                    } else if ev.id == serial_toggle_item.id() {
+                        serial_enabled = !serial_enabled;
+                        let _ = serial_toggle_item.set_text(if serial_enabled { "[x] Serial Output" } else { "[ ] Serial Output" });
+                        let mut sc = serial_cfg.lock().unwrap();
+                        sc.enabled = serial_enabled;
+                    } else if ev.id == serial_refresh_item.id() {
+                        if let Ok(ports) = serialport::available_ports() {
+                            for p in ports {
+                                if !port_items.iter().any(|(_, name)| name == &p.port_name) {
+                                    let label = format!("Use {}", p.port_name);
+                                    let item = MenuItem::new(&label, true, None);
+                                    menu.append(&item).ok();
+                                    port_items.push((item, p.port_name));
+                                }
+                            }
+                        }
                     } else if ev.id == quit_item.id() {
                         if let Some(tx) = overlay_tx_opt.take() { let _ = tx.send(OverlayCmd::Close); }
                         *control_flow = ControlFlow::Exit;
+                    } else {
+                        // Port selection
+                        for (it, name) in &port_items {
+                            if ev.id == it.id() {
+                                let mut sc = serial_cfg.lock().unwrap();
+                                sc.port = name.clone();
+                                let _ = serial_port_label.set_text(&format!("Port: {}", sc.port));
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -204,6 +307,10 @@ fn spawn_monitor_thread(
 
         let (mut active_if_index, mut net_info_cache) = get_network_profile_info();
         let mut prev_net = snapshot_network(active_if_index);
+        // On Windows, use WMI to avoid admin privileges for disk stats.
+        #[cfg(windows)]
+        let disk_counters = win_disk_wmi::DiskCounters::new().ok();
+        #[cfg(not(windows))]
         let mut prev_disk = snapshot_disk();
         let mut last = Instant::now();
         let mut last_net_info_check = Instant::now();
@@ -214,7 +321,10 @@ fn spawn_monitor_thread(
         loop {
             if cmd_rx.try_recv().is_ok() {
                 prev_net = snapshot_network(active_if_index);
-                prev_disk = snapshot_disk();
+                #[cfg(not(windows))]
+                {
+                    prev_disk = snapshot_disk();
+                }
                 max_disk_mbps = RollingMax::default();
                 max_net_kbps = RollingMax::default();
                 last = Instant::now();
@@ -236,11 +346,30 @@ fn spawn_monitor_thread(
             let (mut net_kbps, prev_net_out) = diff_network(prev_net, cur_net, dt.max(1e-3));
             prev_net = prev_net_out;
 
-            let cur_disk = snapshot_disk();
-            let (mut disk_mbps, prev_disk_out) = diff_disk(prev_disk, cur_disk, dt.max(1e-3));
-            prev_disk = prev_disk_out;
+            // Disk throughput (MB/s)
+            #[cfg(windows)]
+            let (mut disk_r_mbps, mut disk_w_mbps, mut disk_mbps): (f64, f64, f64) = {
+                if let Some(ref dc) = disk_counters {
+                    if let Ok((r_bs, w_bs)) = dc.read_total() {
+                        let r = r_bs as f64 / (1024.0 * 1024.0);
+                        let w = w_bs as f64 / (1024.0 * 1024.0);
+                        (r, w, r + w)
+                    } else { (0.0, 0.0, 0.0) }
+                } else { (0.0, 0.0, 0.0) }
+            };
+            #[cfg(not(windows))]
+            let (mut disk_r_mbps, mut disk_w_mbps, mut disk_mbps, prev_disk_out) = {
+                let cur_disk = snapshot_disk();
+                diff_disk(prev_disk, cur_disk, dt.max(1e-3))
+            };
+            #[cfg(not(windows))]
+            {
+                prev_disk = prev_disk_out;
+            }
 
             if disk_mbps.is_finite() && disk_mbps < 0.001 { disk_mbps = 0.0; }
+            if disk_r_mbps.is_finite() && disk_r_mbps < 0.001 { disk_r_mbps = 0.0; }
+            if disk_w_mbps.is_finite() && disk_w_mbps < 0.001 { disk_w_mbps = 0.0; }
             if net_kbps.is_finite()  && net_kbps  < 0.1   { net_kbps  = 0.0; }
 
             let disk_floor = 0.25;
@@ -264,6 +393,8 @@ fn spawn_monitor_thread(
                 let mut sm = shared_metrics.lock().unwrap();
                 sm.cpu_pct   = cpu;
                 sm.ram_pct   = mem_pct;
+                sm.disk_r_mbps = disk_r_mbps;
+                sm.disk_w_mbps = disk_w_mbps;
                 sm.disk_mbps = disk_mbps;
                 sm.net_kbps  = net_kbps;
                 sm.disk_pct  = disk_pct;
@@ -280,8 +411,8 @@ fn spawn_monitor_thread(
                 }
                 Mode::DiskNet => {
                     let tooltip = format!(
-                        "Disk: {:.2} MB/s ({:.0}%) | Net: {} ({:.0}%)",
-                        disk_mbps, disk_pct, format_speed_auto(net_kbps), net_pct
+                        "Disk R/W: {:.2}/{:.2} MB/s ({:.0}%) | Net: {} ({:.0}%)",
+                        disk_r_mbps, disk_w_mbps, disk_pct, format_speed_auto(net_kbps), net_pct
                     );
                     let rgba = make_icon_bars(w, h, disk_pct, net_pct, Palette::DiskNet);
                     let _ = proxy.send_event(AppEvent::Update { tooltip, rgba, w, h });
@@ -369,12 +500,11 @@ fn spawn_overlay_window(
                             y += 18;
                             draw_text_shadowed(hdc, 8, y, &format!("RAM: {:.1}%", m.ram_pct));
                             y += 18;
-                            draw_text_shadowed(
-                                hdc,
-                                8,
-                                y,
-                                &format!("DISK: {:.2} MB/s ({:.0} %)", m.disk_mbps, m.disk_pct),
-                            );
+                            draw_text_shadowed(hdc, 8, y, &format!("DISK R: {:.2} MB/s", m.disk_r_mbps));
+                            y += 18;
+                            draw_text_shadowed(hdc, 8, y, &format!("DISK W: {:.2} MB/s", m.disk_w_mbps));
+                            y += 18;
+                            draw_text_shadowed(hdc, 8, y, &format!("DISK TOT: {:.2} MB/s ({:.0} %)", m.disk_mbps, m.disk_pct));
                             y += 18;
                             draw_text_shadowed(
                                 hdc,
@@ -537,79 +667,12 @@ fn snapshot_network(_interface_index: u32) -> NetBytes {
 }
 
 
-#[cfg(windows)]
-fn snapshot_disk_win() -> DiskBytes {
-    use std::ffi::OsString;
-    use std::mem::{size_of, zeroed};
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::path::PathBuf;
+// Removed old Windows IOCTL-based disk snapshot: replaced by WMI path
 
-    use windows_sys::Win32::Foundation::*;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_READONLY, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    const IOCTL_DISK_PERFORMANCE: u32 = 0x70020;
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct DISK_PERFORMANCE {
-        bytes_read: i64,
-        bytes_written: i64,
-        _rest: [u8; 200],
-    }
-
-    fn open_physical(n: u32) -> Option<std::fs::File> {
-        let path = OsString::from(format!(r"\\.\\PhysicalDrive{}", n));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .access_mode(FILE_GENERIC_READ)
-            .attributes(FILE_ATTRIBUTE_READONLY)
-            .open(PathBuf::from(path))
-            .ok()
-    }
-
-    let mut total_r: u64 = 0;
-    let mut total_w: u64 = 0;
-
-    for n in 0..32 {
-        if let Some(file) = open_physical(n) {
-            let h: HANDLE = file.as_raw_handle() as HANDLE;
-            unsafe {
-                let mut perf: DISK_PERFORMANCE = zeroed();
-                let mut ret = 0u32;
-                let ok = DeviceIoControl(
-                    h,
-                    IOCTL_DISK_PERFORMANCE,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut perf as *mut _ as *mut _,
-                    size_of::<DISK_PERFORMANCE>() as u32,
-                    &mut ret,
-                    std::ptr::null_mut(),
-                );
-
-                if ok != 0 {
-                    if perf.bytes_read > 0 {
-                        total_r = total_r.saturating_add(perf.bytes_read as u64);
-                    }
-                    if perf.bytes_written > 0 {
-                        total_w = total_w.saturating_add(perf.bytes_written as u64);
-                    }
-                }
-            }
-        }
-    }
-
-    DiskBytes { read: total_r, write: total_w }
-}
-
+#[cfg(not(windows))]
 fn snapshot_disk() -> DiskBytes {
     cfg_if::cfg_if! {
-        if #[cfg(all(target_os = "linux", feature = "linux-disk"))] {
+        if #[cfg(target_os = "linux")] {
             let mut read_bytes: u64 = 0;
             let mut write_bytes: u64 = 0;
             if let Ok(ds) = procfs::diskstats() {
@@ -620,8 +683,6 @@ fn snapshot_disk() -> DiskBytes {
                 }
             }
             DiskBytes { read: read_bytes, write: write_bytes }
-        } else if #[cfg(windows)] {
-            snapshot_disk_win()
         } else {
             DiskBytes { read: 0, write: 0 }
         }
@@ -635,11 +696,14 @@ fn diff_network(prev: NetBytes, cur: NetBytes, dt: f64) -> (f64, NetBytes) {
     (kbps, cur)
 }
 
-fn diff_disk(prev: DiskBytes, cur: DiskBytes, dt: f64) -> (f64, DiskBytes) {
+#[cfg(not(windows))]
+fn diff_disk(prev: DiskBytes, cur: DiskBytes, dt: f64) -> (f64, f64, f64, DiskBytes) {
     let dread  = cur.read .saturating_sub(prev.read);
     let dwrite = cur.write.saturating_sub(prev.write);
-    let mbps = if dt > 0.0 { (dread as f64 + dwrite as f64) / dt / (1024.0 * 1024.0) } else { 0.0 };
-    (mbps, cur)
+    let r_mbps = if dt > 0.0 { (dread  as f64) / dt / (1024.0 * 1024.0) } else { 0.0 };
+    let w_mbps = if dt > 0.0 { (dwrite as f64) / dt / (1024.0 * 1024.0) } else { 0.0 };
+    let mbps   = r_mbps + w_mbps;
+    (r_mbps, w_mbps, mbps, cur)
 }
 
 #[derive(Clone, Copy)]
@@ -734,6 +798,63 @@ fn format_speed_auto(kbps: f64) -> String {
     } else {
         format!("{:.1} GB/s", kbps / (1024.0 * 1024.0))
     }
+}
+
+#[derive(Clone)]
+struct SerialCfg { enabled: bool, port: String }
+
+fn spawn_serial_worker(shared: Arc<Mutex<Metrics>>, cfg: Arc<Mutex<SerialCfg>>) {
+    thread::spawn(move || {
+        let mut port: Option<Box<dyn serialport::SerialPort>> = None;
+        loop {
+            let (enabled, port_name, snapshot) = {
+                let c = cfg.lock().unwrap();
+                let s = shared.lock().unwrap().clone();
+                (c.enabled, c.port.clone(), s)
+            };
+
+            if enabled {
+                // ensure port open
+                if port.as_ref().map(|p| p.name().unwrap_or_default()) != Some(port_name.clone()) {
+                    port = None;
+                }
+                if port.is_none() {
+                    match serialport::new(&port_name, 115200).timeout(Duration::from_millis(1000)).open() {
+                        Ok(p) => port = Some(p),
+                        Err(_) => { /* keep trying next loop */ }
+                    }
+                }
+                if let Some(p) = port.as_mut() {
+                    let cpu = snapshot.cpu_pct.round() as i32;
+                    let ram = snapshot.ram_pct.round() as i32;
+                    let disk_r = format_speed_bytes(snapshot.disk_r_mbps * 1024.0 * 1024.0);
+                    let disk_w = format_speed_bytes(snapshot.disk_w_mbps * 1024.0 * 1024.0);
+                    let net_bps = snapshot.net_kbps * 1024.0;
+                    let net_s = format_speed_bytes(net_bps);
+                    let ip = get_primary_ip();
+                    let line = format!("{},{},{},{},{},{}\n", cpu, ram, disk_r, disk_w, net_s, ip);
+                    let _ = p.write_all(line.as_bytes());
+                }
+            } else {
+                port = None;
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+    });
+}
+
+fn format_speed_bytes(bps: f64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bps >= GB { format!("{:.2} GB/s", bps / GB) }
+    else if bps >= MB { format!("{:.2} MB/s", bps / MB) }
+    else if bps >= KB { format!("{:.1} KB/s", bps / KB) }
+    else { format!("{:.0} B/s", bps) }
+}
+
+fn get_primary_ip() -> String {
+    local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "0.0.0.0".into())
 }
 
 #[cfg(windows)]
